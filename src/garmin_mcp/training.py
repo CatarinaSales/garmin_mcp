@@ -804,16 +804,21 @@ def register_tools(app):
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
         """
+        MAX_DAYS = 90
         try:
-            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
-            if end_dt < start_dt:
-                return "Error: end_date must be on or after start_date"
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError as e:
+            return f"Invalid date format: {e}. Use YYYY-MM-DD."
 
-            if (end_dt - start_dt).days > 89:
-                return "Error: date range cannot exceed 90 days"
+        days = (end - start).days + 1
+        if days > MAX_DAYS:
+            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
+        if days < 1:
+            return "end_date must be on or after start_date."
 
         trend = []
+        vo2_by_date: Dict[str, Dict[str, Any]] = {}
         current = start
         while current <= end:
             date_str = current.isoformat()
@@ -837,23 +842,24 @@ def register_tools(app):
                         if not status_data:
                             status_data = dev_data
                     atl_dto = status_data.get("acuteTrainingLoadDTO") or {}
-                    most_recent_vo2 = data.get("mostRecentVO2Max") or {}
-                    vo2_data = most_recent_vo2.get("generic") or {}
-                    entry: Dict[str, Any] = {"date": date_str}
+                    entry: Dict[str, Any] = {
+                        "date": status_data.get("calendarDate") or date_str
+                    }
                     atl = atl_dto.get("dailyTrainingLoadAcute")
                     ctl = atl_dto.get("dailyTrainingLoadChronic")
                     acwr = atl_dto.get("dailyAcuteChronicWorkloadRatio")
                     if atl is not None:
-                        entry["atl"] = round(atl, 1)
+                        entry["acute_training_load"] = round(atl, 1)
                     if ctl is not None:
-                        entry["ctl"] = round(ctl, 1)
-                    if atl is not None and ctl is not None:
-                        entry["tsb"] = round(ctl - atl, 1)
+                        entry["chronic_training_load"] = round(ctl, 1)
                     if acwr is not None:
-                        entry["acwr"] = round(acwr, 2)
+                        entry["acute_chronic_workload_ratio"] = round(acwr, 2)
                     acwr_status = atl_dto.get("acwrStatus")
                     if acwr_status:
                         entry["acwr_status"] = acwr_status
+                    acwr_feedback = atl_dto.get("acwrStatusFeedback")
+                    if acwr_feedback:
+                        entry["acwr_status_feedback"] = acwr_feedback
                     acwr_pct = atl_dto.get("acwrPercent")
                     if acwr_pct is not None:
                         entry["acwr_percent"] = acwr_pct
@@ -867,58 +873,55 @@ def register_tools(app):
                     # longer wrapped in a trainingStatusDTO sub-object.
                     ts_phrase = status_data.get("trainingStatusFeedbackPhrase")
                     if ts_phrase:
-                        entry["training_status"] = ts_phrase
+                        entry["training_status_feedback"] = ts_phrase
                     ts_code = status_data.get("trainingStatus")
                     if ts_code is not None:
-                        entry["training_status_code"] = ts_code
+                        entry["training_status"] = ts_code
                     fitness_trend = status_data.get("fitnessTrend")
                     if fitness_trend is not None:
                         entry["fitness_trend"] = fitness_trend
-                    vo2 = vo2_data.get("vo2MaxValue")
-                    if vo2 is not None:
-                        entry["vo2_max"] = round(vo2, 1)
                     if len(entry) > 1:  # has more than just date
                         trend.append(entry)
+
+                    # VO2 max is a separate Garmin measurement. Preserve the
+                    # measurement date reported by Garmin instead of assigning
+                    # the query date or duplicating it in every load entry.
+                    generic = (
+                        (data.get("mostRecentVO2Max") or {}).get("generic") or {}
+                    )
+                    measurement_date = generic.get("calendarDate")
+                    vo2_value = generic.get("vo2MaxValue")
+                    if (
+                        isinstance(measurement_date, str)
+                        and vo2_value is not None
+                        and start_date <= measurement_date <= end_date
+                    ):
+                        measurement: Dict[str, Any] = {
+                            "date": measurement_date,
+                            "vo2_max": round(vo2_value, 1),
+                        }
+                        precise_value = generic.get("vo2MaxPreciseValue")
+                        if precise_value is not None:
+                            measurement["vo2_max_precise"] = round(
+                                precise_value, 1
+                            )
+                        vo2_by_date[measurement_date] = measurement
             except Exception:
                 pass  # skip days with no data
             current += datetime.timedelta(days=1)
 
-                    if generic:
-                        measurement_date = generic.get("calendarDate")
-                        vo2_value = generic.get("vo2MaxValue")
+        result = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "days_with_data": len(trend),
+            "trend": trend,
+        }
 
-                        if (
-                            measurement_date
-                            and vo2_value is not None
-                            and start_date <= measurement_date <= end_date
-                        ):
-                            vo2_by_date[measurement_date] = round(vo2_value, 1)
+        if vo2_by_date:
+            latest_vo2_date = max(vo2_by_date)
+            result["most_recent_vo2_max"] = vo2_by_date[latest_vo2_date]
 
-                except Exception:
-                    pass
-
-                current += datetime.timedelta(days=1)
-
-            result = {
-                "start_date": start_date,
-                "end_date": end_date,
-                "days_with_data": len(trend),
-                "trend": trend,
-            }
-
-            if vo2_by_date:
-                latest_vo2_date = max(vo2_by_date)
-                result["most_recent_vo2_max"] = {
-                    "date": latest_vo2_date,
-                    "vo2_max": vo2_by_date[latest_vo2_date],
-                }
-
-            return json.dumps(result, indent=2)
-
-        except ValueError:
-            return "Error: dates must be in YYYY-MM-DD format"
-        except Exception as e:
-            return f"Error retrieving training load trend: {str(e)}"
+        return json.dumps(result, indent=2)
 
     @app.tool()
     async def get_training_load_balance(date: str) -> str:
@@ -1115,14 +1118,18 @@ def register_tools(app):
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
         """
+        MAX_DAYS = 90
         try:
-            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
-            if end_dt < start_dt:
-                return "Error: end_date must be on or after start_date"
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError as e:
+            return f"Invalid date format: {e}. Use YYYY-MM-DD."
 
-            if (end_dt - start_dt).days > 89:
-                return "Error: date range cannot exceed 90 days"
+        days = (end - start).days + 1
+        if days > MAX_DAYS:
+            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
+        if days < 1:
+            return "end_date must be on or after start_date."
 
         histories: Dict[str, List[Dict[str, Any]]] = {
             "running": [],
@@ -1143,38 +1150,71 @@ def register_tools(app):
         current = start
         while current <= end:
             date_str = current.isoformat()
-            measurements: Dict[str, float] = {}
-            source = None
+            range_values = (
+                range_measurements.get(date_str, {})
+                if range_measurements is not None
+                else {}
+            )
 
-            if range_measurements is not None:
-                measurements = range_measurements.get(date_str, {})
-                if measurements:
-                    source = "get_max_metrics"
-                method_names = ("get_training_status",) if not measurements else ()
+            if range_values:
+                for sport, vo2 in range_values.items():
+                    histories[sport].append(
+                        {
+                            "date": date_str,
+                            "vo2_max": round(vo2, 1),
+                            "source": "get_max_metrics",
+                        }
+                    )
             else:
-                method_names = ("get_training_status", "get_max_metrics")
-
-            for method_name in method_names:
-                method = getattr(garmin_client, method_name, None)
-                if not callable(method):
-                    continue
+                # mostRecentVO2Max can repeat an older measurement on every
+                # queried day. Use Garmin's calendarDate and deduplicate by
+                # that measurement date instead of assigning date_str.
                 try:
-                    measurements = _extract_vo2_measurements(method(date_str))
+                    status_data = garmin_client.get_training_status(date_str)
                 except Exception:
-                    continue
-                if not measurements:
-                    continue
-                source = method_name
-                break
+                    status_data = None
 
-            for sport, vo2 in measurements.items():
-                histories[sport].append(
-                    {
-                        "date": date_str,
-                        "vo2_max": round(vo2, 1),
-                        "source": source,
-                    }
+                most_recent = (
+                    (status_data or {}).get("mostRecentVO2Max") or {}
                 )
+                for section_name, sport in (
+                    ("generic", "running"),
+                    ("cycling", "cycling"),
+                ):
+                    section = _as_dict(most_recent.get(section_name))
+                    measurement_date = section.get("calendarDate")
+                    vo2 = section.get("vo2MaxValue")
+                    if vo2 is None:
+                        vo2 = section.get("vo2MaxPreciseValue")
+
+                    if (
+                        not isinstance(measurement_date, str)
+                        or not isinstance(vo2, (int, float))
+                        or isinstance(vo2, bool)
+                        or not math.isfinite(vo2)
+                        or not start_date <= measurement_date <= end_date
+                    ):
+                        continue
+
+                    if any(
+                        entry["date"] == measurement_date
+                        for entry in histories[sport]
+                    ):
+                        continue
+
+                    entry: Dict[str, Any] = {
+                        "date": measurement_date,
+                        "vo2_max": round(float(vo2), 1),
+                        "source": "get_training_status",
+                    }
+                    precise_value = section.get("vo2MaxPreciseValue")
+                    if isinstance(precise_value, (int, float)) and not isinstance(
+                        precise_value, bool
+                    ):
+                        entry["vo2_max_precise"] = round(
+                            float(precise_value), 1
+                        )
+                    histories[sport].append(entry)
             current += datetime.timedelta(days=1)
 
         selected_sport = None
@@ -1189,12 +1229,11 @@ def register_tools(app):
             )
 
         trend = []
-        last_vo2 = None
         if selected_sport is not None:
-            for entry in histories[selected_sport]:
-                if entry["vo2_max"] != last_vo2:
-                    trend.append(entry)
-                    last_vo2 = entry["vo2_max"]
+            trend = sorted(
+                histories[selected_sport],
+                key=lambda entry: entry["date"],
+            )
 
         current_estimate = None
         current_sport = None
@@ -1243,6 +1282,9 @@ def register_tools(app):
                 "Historical VO2 max values were not available from Garmin; "
                 "returning the current profile estimate separately."
             )
+
+        if trend:
+            response["most_recent_vo2_max"] = trend[-1]
 
         return json.dumps(response, indent=2)
 

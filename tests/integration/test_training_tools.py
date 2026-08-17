@@ -263,6 +263,60 @@ async def test_get_training_status_tool(app_with_training, mock_garmin_client):
 
 
 @pytest.mark.asyncio
+async def test_get_training_load_trend_preserves_garmin_contract(
+    app_with_training, mock_garmin_client
+):
+    """Keep Garmin load/status fields and do not synthesize TSB."""
+    mock_garmin_client.get_training_status.return_value = {
+        "mostRecentTrainingStatus": {
+            "latestTrainingStatusData": {
+                "123": {
+                    "primaryTrainingDevice": True,
+                    "calendarDate": "2024-01-15",
+                    "acuteTrainingLoadDTO": {
+                        "dailyTrainingLoadAcute": 12.34,
+                        "dailyTrainingLoadChronic": 45.67,
+                        "dailyAcuteChronicWorkloadRatio": 0.27,
+                        "acwrPercent": 27,
+                        "acwrStatus": "LOW",
+                        "acwrStatusFeedback": "ACWR_LOW",
+                    },
+                    "trainingStatus": 3,
+                    "trainingStatusFeedbackPhrase": "RECOVERY",
+                }
+            }
+        },
+        "mostRecentVO2Max": {
+            "generic": {
+                "calendarDate": "2024-01-14",
+                "vo2MaxValue": 48.0,
+            }
+        },
+    }
+
+    result = await app_with_training.call_tool(
+        "get_training_load_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+    )
+
+    data = json.loads(result[0][0].text)
+    entry = data["trend"][0]
+    assert entry["acute_training_load"] == 12.3
+    assert entry["chronic_training_load"] == 45.7
+    assert entry["acute_chronic_workload_ratio"] == 0.27
+    assert entry["acwr_percent"] == 27
+    assert entry["acwr_status"] == "LOW"
+    assert entry["acwr_status_feedback"] == "ACWR_LOW"
+    assert entry["training_status"] == 3
+    assert entry["training_status_feedback"] == "RECOVERY"
+    assert "atl" not in entry
+    assert "ctl" not in entry
+    assert "tsb" not in entry
+    # The measurement is outside the requested range and must not be promoted.
+    assert "most_recent_vo2_max" not in data
+
+
+@pytest.mark.asyncio
 async def test_get_vo2max_trend_falls_back_to_profile(
     app_with_training, mock_garmin_client
 ):
@@ -362,8 +416,22 @@ async def test_get_vo2max_trend_prefers_training_status(
 ):
     """Test common historical data avoids extra fallback requests"""
     mock_garmin_client.get_training_status.side_effect = [
-        {"mostRecentVO2Max": {"generic": {"vo2MaxValue": 48.0}}},
-        {"mostRecentVO2Max": {"generic": {"vo2MaxValue": 48.5}}},
+        {
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2024-01-14",
+                    "vo2MaxValue": 48.0,
+                }
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2024-01-15",
+                    "vo2MaxValue": 48.5,
+                }
+            }
+        },
     ]
 
     result = await app_with_training.call_tool(
@@ -389,17 +457,36 @@ async def test_get_vo2max_trend_preserves_selected_cycling_from_mixed_payloads(
     )
     mock_garmin_client.connectapi.return_value = []
     mock_garmin_client.get_training_status.side_effect = [
-        {"mostRecentVO2Max": {"cycling": {"vo2MaxValue": 55.0}}},
         {
             "mostRecentVO2Max": {
-                "generic": {"vo2MaxValue": 48.0},
-                "cycling": {"vo2MaxValue": 56.0},
+                "cycling": {
+                    "calendarDate": "2024-01-13",
+                    "vo2MaxValue": 55.0,
+                }
             }
         },
         {
             "mostRecentVO2Max": {
-                "generic": {"vo2MaxValue": 48.5},
-                "cycling": {"vo2MaxValue": 57.0},
+                "generic": {
+                    "calendarDate": "2024-01-14",
+                    "vo2MaxValue": 48.0,
+                },
+                "cycling": {
+                    "calendarDate": "2024-01-14",
+                    "vo2MaxValue": 56.0,
+                },
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2024-01-15",
+                    "vo2MaxValue": 48.5,
+                },
+                "cycling": {
+                    "calendarDate": "2024-01-15",
+                    "vo2MaxValue": 57.0,
+                },
             }
         },
     ]
@@ -441,9 +528,30 @@ async def test_get_vo2max_trend_selects_sport_with_most_history(
     )
     mock_garmin_client.connectapi.return_value = []
     mock_garmin_client.get_training_status.side_effect = [
-        {"mostRecentVO2Max": {"cycling": {"vo2MaxValue": 55.0}}},
-        {"mostRecentVO2Max": {"generic": {"vo2MaxValue": 48.0}}},
-        {"mostRecentVO2Max": {"generic": {"vo2MaxValue": 48.5}}},
+        {
+            "mostRecentVO2Max": {
+                "cycling": {
+                    "calendarDate": "2024-01-13",
+                    "vo2MaxValue": 55.0,
+                }
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2024-01-14",
+                    "vo2MaxValue": 48.0,
+                }
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2024-01-15",
+                    "vo2MaxValue": 48.5,
+                }
+            }
+        },
     ]
 
     result = await app_with_training.call_tool(
@@ -500,7 +608,12 @@ async def test_get_vo2max_trend_range_failure_does_not_retry_max_metrics_daily(
     )
     mock_garmin_client.connectapi.side_effect = RuntimeError("API unavailable")
     mock_garmin_client.get_training_status.return_value = {
-        "mostRecentVO2Max": {"generic": {"vo2MaxValue": 48.0}}
+        "mostRecentVO2Max": {
+            "generic": {
+                "calendarDate": "2024-01-15",
+                "vo2MaxValue": 48.0,
+            }
+        }
     }
 
     result = await app_with_training.call_tool(
@@ -509,15 +622,17 @@ async def test_get_vo2max_trend_range_failure_does_not_retry_max_metrics_daily(
 
     data = json.loads(result[0][0].text)
     assert data["sport"] == "running"
+    assert data["data_points"] == 1
+    assert data["trend"][0]["date"] == "2024-01-15"
     assert mock_garmin_client.get_training_status.call_count == 2
     mock_garmin_client.get_max_metrics.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_get_vo2max_trend_uses_daily_max_metrics_for_older_clients(
+async def test_get_vo2max_trend_does_not_promote_undated_daily_metrics(
     app_with_training, mock_garmin_client
 ):
-    """Test clients without the range API keep the compatible daily fallback"""
+    """Undated values must not be assigned to the query date."""
     mock_garmin_client.garmin_connect_metrics_url = None
     mock_garmin_client.get_training_status.return_value = {}
     mock_garmin_client.get_max_metrics.return_value = [
@@ -528,10 +643,9 @@ async def test_get_vo2max_trend_uses_daily_max_metrics_for_older_clients(
         "get_vo2max_trend", {"start_date": "2024-01-15", "end_date": "2024-01-15"}
     )
 
-    data = json.loads(result[0][0].text)
-    assert data["latest_vo2_max"] == 48.0
+    assert "No VO2 max data found" in result[0][0].text
     mock_garmin_client.connectapi.assert_not_called()
-    mock_garmin_client.get_max_metrics.assert_called_once_with("2024-01-15")
+    mock_garmin_client.get_max_metrics.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -545,8 +659,14 @@ async def test_get_vo2max_trend_prefers_running_when_sport_coverage_is_tied(
     mock_garmin_client.connectapi.return_value = []
     mock_garmin_client.get_training_status.return_value = {
         "mostRecentVO2Max": {
-            "generic": {"vo2MaxValue": 48.0},
-            "cycling": {"vo2MaxValue": 55.0},
+            "generic": {
+                "calendarDate": "2024-01-15",
+                "vo2MaxValue": 48.0,
+            },
+            "cycling": {
+                "calendarDate": "2024-01-15",
+                "vo2MaxValue": 55.0,
+            },
         }
     }
 
