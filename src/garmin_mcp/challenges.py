@@ -119,11 +119,15 @@ def _format_distance(meters: float) -> str:
 
 
 def _format_timestamp(timestamp_ms: int) -> str:
-    """Convert millisecond timestamp to readable date string"""
+    """Convert a Garmin GMT millisecond timestamp to its UTC date."""
     if timestamp_ms is None:
         return None
-    dt = datetime.datetime.fromtimestamp(timestamp_ms / 1000.0)
-    return dt.strftime("%Y-%m-%d")
+
+    dt_utc = datetime.datetime.fromtimestamp(
+        timestamp_ms / 1000.0,
+        tz=datetime.timezone.utc,
+    )
+    return dt_utc.strftime("%Y-%m-%d")
 
 
 def _parse_iso_date(iso_string: str) -> str:
@@ -276,7 +280,7 @@ def register_tools(app):
                     "type_id": type_id,
                     "value": formatted_value,
                     "raw_value": raw_value,
-                    "date": _format_timestamp(record.get("prStartTimeGMT")),
+                    "date": _format_timestamp(record.get("prStartTimeGmt")),
                 }
 
                 # Add activity info if available

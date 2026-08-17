@@ -217,7 +217,14 @@ def register_tools(app):
                     "sleep_factor_percent": r.get('sleepScoreFactorPercent'),
                     "sleep_factor_feedback": r.get('sleepScoreFactorFeedback'),
 
-                    "recovery_time_hours": round(r.get('recoveryTime', 0) / 60, 1) if r.get('recoveryTime') else None,
+                    # Garmin recoveryTime is reported in minutes.
+                    # Preserve the source value and also expose hours as a convenience conversion.
+                    "recovery_time_minutes": r.get('recoveryTime'),
+                    "recovery_time_hours": (
+                        round(r.get('recoveryTime') / 60, 1)
+                        if r.get('recoveryTime') is not None
+                        else None
+                    ),
                     "recovery_factor_percent": r.get('recoveryTimeFactorPercent'),
                     "recovery_factor_feedback": r.get('recoveryTimeFactorFeedback'),
 
@@ -377,8 +384,8 @@ def register_tools(app):
     async def get_heart_rates_summary(date: str) -> str:
         """Get heart rate summary with essential metrics (lightweight version)
 
-        Returns a compact summary (~500 bytes) instead of full time-series data (~25KB).
-        Ideal for daily health checkups and LLM integrations.
+        Returns a compact summary instead of full time-series data.
+        Includes Garmin abnormal heart rate alert metadata when available.
 
         Args:
             date: Date in YYYY-MM-DD format
@@ -388,28 +395,398 @@ def register_tools(app):
             if not hr_data:
                 return f"No heart rate data found for {date}"
 
+            abnormal_values = hr_data.get('abnormalHRValuesArray') or []
+
             summary = {
                 "date": hr_data.get('calendarDate'),
                 "max_heart_rate_bpm": hr_data.get('maxHeartRate'),
                 "min_heart_rate_bpm": hr_data.get('minHeartRate'),
                 "resting_heart_rate_bpm": hr_data.get('restingHeartRate'),
                 "last_7_days_avg_resting_hr": hr_data.get('lastSevenDaysAvgRestingHeartRate'),
+                "abnormal_hr_threshold_bpm": hr_data.get('abnormalHrThresholdValue'),
+                "abnormal_hr_alert_count": len(abnormal_values),
             }
 
-            # Calculate average from time-series if available
             hr_values = hr_data.get('heartRateValues', [])
             if hr_values:
                 valid_values = [v[1] for v in hr_values if v[1] and v[1] > 0]
                 if valid_values:
-                    summary["avg_heart_rate_bpm"] = round(sum(valid_values) / len(valid_values), 1)
+                    summary["avg_heart_rate_bpm"] = round(
+                        sum(valid_values) / len(valid_values), 1
+                    )
                     summary["data_points_count"] = len(valid_values)
 
-            # Remove None values
-            summary = {k: v for k, v in summary.items() if v is not None}
+            summary = {
+                k: v for k, v in summary.items()
+                if v is not None
+                or k in (
+                    "abnormal_hr_threshold_bpm",
+                    "abnormal_hr_alert_count",
+                )
+            }
 
             return json.dumps(summary, indent=2)
         except Exception as e:
             return f"Error retrieving heart rate summary: {str(e)}"
+
+    @app.tool()
+    async def get_abnormal_heart_rate_alerts(date: str) -> str:
+        """Get Garmin abnormal heart rate alerts for a specific date.
+
+        Returns only alerts explicitly reported by Garmin Connect in
+        abnormalHRValuesArray. Alerts are not inferred from heartRateValues.
+        This tool is read-only.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+        """
+        try:
+            hr_data = garmin_client.get_heart_rates(date)
+            if not hr_data:
+                return f"No heart rate data found for {date}"
+
+            abnormal_values = hr_data.get('abnormalHRValuesArray') or []
+            threshold = hr_data.get('abnormalHrThresholdValue')
+
+            alerts = []
+            for item in abnormal_values:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+
+                alerts.append({
+                    "timestamp_ms": item[0],
+                    "heart_rate_bpm": item[1],
+                })
+
+            result = {
+                "date": hr_data.get('calendarDate') or date,
+                "abnormal_hr_threshold_bpm": threshold,
+                "alert_count": len(alerts),
+                "alerts": alerts,
+            }
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return (
+                "Error retrieving abnormal heart rate alerts: "
+                f"{str(e)}"
+            )
+
+    @app.tool()
+    async def get_daily_health_snapshot(date: str) -> str:
+        """Get a compact, non-interpretive daily Garmin health snapshot.
+
+        Aggregates key daily Garmin health data while preserving source
+        availability and null values. Detailed abnormal heart-rate alert
+        timestamps remain available through get_abnormal_heart_rate_alerts().
+
+        The snapshot does not apply health, recovery, or training interpretation.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+        """
+        completeness = {
+            "stats": False,
+            "heart_rate": False,
+            "sleep": False,
+            "stress": False,
+            "training_readiness": False,
+        }
+
+        stats = None
+        heart_rate_data = None
+        sleep_data = None
+        stress_data = None
+        readiness_data = None
+
+        # Each source is independent so partial Garmin synchronization or a
+        # source-specific failure does not prevent the rest of the snapshot.
+        try:
+            stats = garmin_client.get_stats(date)
+            completeness["stats"] = bool(stats)
+        except Exception:
+            stats = None
+
+        try:
+            heart_rate_data = garmin_client.get_heart_rates(date)
+            completeness["heart_rate"] = bool(heart_rate_data)
+        except Exception:
+            heart_rate_data = None
+
+        try:
+            sleep_data = garmin_client.get_sleep_data(date)
+            completeness["sleep"] = bool(sleep_data)
+        except Exception:
+            sleep_data = None
+
+        try:
+            stress_data = garmin_client.get_stress_data(date)
+            completeness["stress"] = bool(stress_data)
+        except Exception:
+            stress_data = None
+
+        try:
+            readiness_data = garmin_client.get_training_readiness(date)
+            completeness["training_readiness"] = bool(readiness_data)
+        except Exception:
+            readiness_data = None
+
+        # ------------------------------------------------------------
+        # Activity / daily stats
+        # ------------------------------------------------------------
+        activity = None
+        body_battery = None
+        respiration = None
+        stats_spo2 = None
+
+        if stats:
+            activity = {
+                "total_steps": stats.get("totalSteps"),
+                "daily_step_goal": stats.get("dailyStepGoal"),
+                "distance_meters": stats.get("totalDistanceMeters"),
+                "total_calories": stats.get("totalKilocalories"),
+                "active_calories": stats.get("activeKilocalories"),
+                "bmr_calories": stats.get("bmrKilocalories"),
+                "moderate_intensity_minutes": stats.get("moderateIntensityMinutes"),
+                "vigorous_intensity_minutes": stats.get("vigorousIntensityMinutes"),
+                "intensity_minutes_goal": stats.get("intensityMinutesGoal"),
+            }
+
+            body_battery = {
+                "charged": stats.get("bodyBatteryChargedValue"),
+                "drained": stats.get("bodyBatteryDrainedValue"),
+                "highest": stats.get("bodyBatteryHighestValue"),
+                "lowest": stats.get("bodyBatteryLowestValue"),
+                "current": stats.get("bodyBatteryMostRecentValue"),
+            }
+
+            respiration = {
+                "avg_waking_breaths_per_min": stats.get("avgWakingRespirationValue"),
+                "highest_breaths_per_min": stats.get("highestRespirationValue"),
+                "lowest_breaths_per_min": stats.get("lowestRespirationValue"),
+            }
+
+            # get_stats() uses Spo2 capitalization in this Garmin contract.
+            stats_spo2 = {
+                "avg_percent": stats.get("averageSpo2"),
+                "lowest_percent": stats.get("lowestSpo2"),
+            }
+
+        # ------------------------------------------------------------
+        # Heart rate
+        # ------------------------------------------------------------
+        heart_rate = None
+
+        if heart_rate_data:
+            abnormal_values = (
+                heart_rate_data.get("abnormalHRValuesArray") or []
+            )
+
+            valid_hr_values = []
+            for item in heart_rate_data.get("heartRateValues") or []:
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) > 1
+                    and item[1] is not None
+                    and item[1] > 0
+                ):
+                    valid_hr_values.append(item[1])
+
+            avg_hr = (
+                round(sum(valid_hr_values) / len(valid_hr_values), 1)
+                if valid_hr_values
+                else None
+            )
+
+            heart_rate = {
+                "min_bpm": heart_rate_data.get("minHeartRate"),
+                "max_bpm": heart_rate_data.get("maxHeartRate"),
+                "resting_bpm": heart_rate_data.get("restingHeartRate"),
+                "last_7_days_avg_resting_bpm": heart_rate_data.get(
+                    "lastSevenDaysAvgRestingHeartRate"
+                ),
+                "avg_bpm": avg_hr,
+                "abnormal_hr_threshold_bpm": heart_rate_data.get(
+                    "abnormalHrThresholdValue"
+                ),
+                "abnormal_hr_alert_count": len(abnormal_values),
+            }
+
+        # ------------------------------------------------------------
+        # Sleep + sleep SpO2
+        # ------------------------------------------------------------
+        sleep = None
+        sleep_spo2 = None
+
+        if sleep_data:
+            daily_sleep = sleep_data.get("dailySleepDTO") or {}
+            sleep_spo2_dto = (
+                sleep_data.get("wellnessSpO2SleepSummaryDTO") or {}
+            )
+
+            sleep_seconds = daily_sleep.get("sleepTimeSeconds")
+            sleep_hours = (
+                round(sleep_seconds / 3600, 2)
+                if sleep_seconds is not None
+                else None
+            )
+
+            sleep = {
+                "sleep_seconds": sleep_seconds,
+                "sleep_hours": sleep_hours,
+                "nap_seconds": daily_sleep.get("napTimeSeconds"),
+                "sleep_start_gmt": daily_sleep.get("sleepStartTimestampGMT"),
+                "sleep_end_gmt": daily_sleep.get("sleepEndTimestampGMT"),
+                "sleep_score": (
+                    daily_sleep
+                    .get("sleepScores", {})
+                    .get("overall", {})
+                    .get("value")
+                ),
+                "sleep_score_qualifier": (
+                    daily_sleep
+                    .get("sleepScores", {})
+                    .get("overall", {})
+                    .get("qualifierKey")
+                ),
+                "deep_sleep_seconds": daily_sleep.get("deepSleepSeconds"),
+                "light_sleep_seconds": daily_sleep.get("lightSleepSeconds"),
+                "rem_sleep_seconds": daily_sleep.get("remSleepSeconds"),
+                "awake_seconds": daily_sleep.get("awakeSleepSeconds"),
+                "awake_count": daily_sleep.get("awakeCount"),
+                "restless_moments_count": daily_sleep.get(
+                    "restlessMomentsCount"
+                ),
+                "avg_sleep_stress": daily_sleep.get("avgSleepStress"),
+                "avg_overnight_hrv_ms": sleep_data.get("avgOvernightHrv"),
+            }
+
+            if sleep_spo2_dto:
+                # Sleep SpO2 uses yet another Garmin capitalization contract.
+                sleep_spo2 = {
+                    "avg_sleep_percent": sleep_spo2_dto.get("averageSPO2"),
+                    "lowest_sleep_percent": sleep_spo2_dto.get("lowestSPO2"),
+                }
+
+        # Merge daily and sleep SpO2 without adding another Garmin request.
+        spo2 = None
+        if stats_spo2 is not None or sleep_spo2 is not None:
+            spo2 = {}
+            if stats_spo2 is not None:
+                spo2.update(stats_spo2)
+            if sleep_spo2 is not None:
+                spo2.update(sleep_spo2)
+
+        # ------------------------------------------------------------
+        # Stress
+        # ------------------------------------------------------------
+        stress = None
+        if stress_data:
+            valid_stress_values = []
+            for item in stress_data.get("stressValuesArray") or []:
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) > 1
+                    and item[1] is not None
+                    and item[1] > 0
+                ):
+                    valid_stress_values.append(item[1])
+
+            stress = {
+                "avg_level": stress_data.get("avgStressLevel"),
+                "max_level": stress_data.get("maxStressLevel"),
+                "data_points_count": len(valid_stress_values),
+            }
+
+        # ------------------------------------------------------------
+        # Training readiness
+        # ------------------------------------------------------------
+        training_readiness = None
+        if readiness_data:
+            training_readiness = []
+
+            for readiness_item in readiness_data:
+                recovery_minutes = readiness_item.get("recoveryTime")
+
+                # Map every readiness record independently. Do not reuse values
+                # across records because Garmin can return multiple readiness
+                # assessments for the same calendar date.
+                readiness_entry = {
+                    "date": readiness_item.get("calendarDate"),
+                    "timestamp_local": readiness_item.get("timestampLocal"),
+                    "context": readiness_item.get("inputContext"),
+                    "level": readiness_item.get("level"),
+                    "score": readiness_item.get("score"),
+                    "feedback": readiness_item.get("feedbackShort"),
+
+                    "sleep_score": readiness_item.get("sleepScore"),
+                    "sleep_factor_percent": readiness_item.get(
+                        "sleepScoreFactorPercent"
+                    ),
+                    "sleep_factor_feedback": readiness_item.get(
+                        "sleepScoreFactorFeedback"
+                    ),
+
+                    "recovery_time_minutes": recovery_minutes,
+                    "recovery_time_hours": (
+                        round(recovery_minutes / 60, 1)
+                        if recovery_minutes is not None
+                        else None
+                    ),
+                    "recovery_factor_percent": readiness_item.get(
+                        "recoveryTimeFactorPercent"
+                    ),
+                    "recovery_factor_feedback": readiness_item.get(
+                        "recoveryTimeFactorFeedback"
+                    ),
+
+                    "training_load_factor_percent": readiness_item.get(
+                        "acwrFactorPercent"
+                    ),
+                    "training_load_feedback": readiness_item.get(
+                        "acwrFactorFeedback"
+                    ),
+                    "acute_load": readiness_item.get("acuteLoad"),
+
+                    "hrv_factor_percent": readiness_item.get("hrvFactorPercent"),
+                    "hrv_factor_feedback": readiness_item.get(
+                        "hrvFactorFeedback"
+                    ),
+                    "hrv_weekly_avg_ms": readiness_item.get(
+                        "hrvWeeklyAverage"
+                    ),
+
+                    "stress_history_factor_percent": readiness_item.get(
+                        "stressHistoryFactorPercent"
+                    ),
+                    "stress_history_feedback": readiness_item.get(
+                        "stressHistoryFactorFeedback"
+                    ),
+
+                    "sleep_history_factor_percent": readiness_item.get(
+                        "sleepHistoryFactorPercent"
+                    ),
+                    "sleep_history_feedback": readiness_item.get(
+                        "sleepHistoryFactorFeedback"
+                    ),
+                }
+
+                training_readiness.append(readiness_entry)
+
+        result = {
+            "date": date,
+            "completeness": completeness,
+            "activity": activity,
+            "heart_rate": heart_rate,
+            "sleep": sleep,
+            "stress": stress,
+            "spo2": spo2,
+            "respiration": respiration,
+            "body_battery": body_battery,
+            "training_readiness": training_readiness,
+        }
+
+        return json.dumps(result, indent=2)
 
     @app.tool()
     async def get_hydration_data(date: str) -> str:
@@ -502,15 +879,29 @@ def register_tools(app):
             if 'avgOvernightHrv' in sleep_data:
                 summary['avg_overnight_hrv'] = sleep_data.get('avgOvernightHrv')
 
-            # Calculate sleep phase percentages if total sleep time is available
-            total_sleep = summary.get('sleep_seconds', 0)
-            if total_sleep and total_sleep > 0:
-                summary['deep_sleep_percent'] = round((summary.get('deep_sleep_seconds', 0) / total_sleep) * 100, 1)
-                summary['light_sleep_percent'] = round((summary.get('light_sleep_seconds', 0) / total_sleep) * 100, 1)
-                summary['rem_sleep_percent'] = round((summary.get('rem_sleep_seconds', 0) / total_sleep) * 100, 1)
+            # Calculate sleep phase percentages only when Garmin provides
+            # both total sleep time and the individual stage value.
+            total_sleep = summary.get('sleep_seconds')
+            if total_sleep is not None and total_sleep > 0:
+                deep_sleep = summary.get('deep_sleep_seconds')
+                light_sleep = summary.get('light_sleep_seconds')
+                rem_sleep = summary.get('rem_sleep_seconds')
+
+                if deep_sleep is not None:
+                    summary['deep_sleep_percent'] = round(
+                        (deep_sleep / total_sleep) * 100, 1
+                    )
+                if light_sleep is not None:
+                    summary['light_sleep_percent'] = round(
+                        (light_sleep / total_sleep) * 100, 1
+                    )
+                if rem_sleep is not None:
+                    summary['rem_sleep_percent'] = round(
+                        (rem_sleep / total_sleep) * 100, 1
+                    )
 
             # Convert sleep duration to hours for convenience
-            if total_sleep:
+            if total_sleep is not None:
                 summary['sleep_hours'] = round(total_sleep / 3600, 2)
 
             # Remove None values
@@ -560,21 +951,18 @@ def register_tools(app):
                 "avg_stress_level": stress_data.get('avgStressLevel'),
             }
 
-            # Calculate stress distribution from time-series if available
+            # Count valid Garmin stress readings without imposing
+            # connector-defined stress bands or interpretation.
             stress_values = stress_data.get('stressValuesArray', [])
             if stress_values:
-                # Filter valid stress readings (exclude -1 and -2 which are gaps/activity)
-                valid_values = [v[1] for v in stress_values if v[1] and v[1] > 0]
-                rest_values = [v for v in valid_values if v < 26]
-                low_values = [v for v in valid_values if 26 <= v < 51]
-                medium_values = [v for v in valid_values if 51 <= v < 76]
-                high_values = [v for v in valid_values if v >= 76]
-
-                total = len(valid_values) if valid_values else 1
-                summary["rest_percent"] = round(len(rest_values) / total * 100, 1)
-                summary["low_stress_percent"] = round(len(low_values) / total * 100, 1)
-                summary["medium_stress_percent"] = round(len(medium_values) / total * 100, 1)
-                summary["high_stress_percent"] = round(len(high_values) / total * 100, 1)
+                valid_values = [
+                    v[1]
+                    for v in stress_values
+                    if isinstance(v, (list, tuple))
+                    and len(v) > 1
+                    and v[1] is not None
+                    and v[1] > 0
+                ]
                 summary["data_points_count"] = len(valid_values)
 
             # Remove None values

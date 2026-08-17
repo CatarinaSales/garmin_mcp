@@ -74,11 +74,26 @@ def register_tools(app):
                 "user_profile_id": device.get("userProfileNumber"),
             }
 
-            # Format last upload time if available
+            # Preserve the Garmin epoch and expose an explicit UTC timestamp.
+            # Keep last_upload_time for backward compatibility; it remains the
+            # legacy host-local representation and should not be used when an
+            # unambiguous timestamp is required.
             upload_time_ms = device.get("lastUsedDeviceUploadTime")
-            if upload_time_ms:
-                dt = datetime.datetime.fromtimestamp(upload_time_ms / 1000.0)
-                curated["last_upload_time"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            if upload_time_ms is not None:
+                curated["last_upload_timestamp_ms"] = upload_time_ms
+
+                dt_utc = datetime.datetime.fromtimestamp(
+                    upload_time_ms / 1000.0,
+                    tz=datetime.timezone.utc,
+                )
+                curated["last_upload_time_utc"] = dt_utc.isoformat()
+
+                dt_legacy = datetime.datetime.fromtimestamp(
+                    upload_time_ms / 1000.0
+                )
+                curated["last_upload_time"] = dt_legacy.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
 
             # Add image URL if available
             if device.get("imageUrl"):

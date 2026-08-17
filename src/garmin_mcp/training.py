@@ -789,12 +789,14 @@ def register_tools(app):
 
     @app.tool()
     async def get_training_load_trend(start_date: str, end_date: str) -> str:
-        """Get the Performance Management Chart (CTL/ATL/TSB) over a date range.
+        """Get Garmin training load data over a date range.
 
-        Returns Chronic Training Load (CTL, 42-day fitness), Acute Training Load (ATL, 7-day fatigue),
-        Training Stress Balance (TSB = CTL - ATL, form/freshness), and Acute:Chronic Workload Ratio
-        (ACWR) per day. Use this to assess whether the athlete is building fitness, peaking, or
-        accumulating too much fatigue.
+        Returns Garmin acute training load, chronic training load,
+        acute:chronic workload ratio (ACWR), ACWR status, training status,
+        and the most recent VO2 max when available.
+
+        This tool preserves Garmin training-load metrics and does not add
+        training or recovery interpretation.
 
         Recommended range: 4-8 weeks. Maximum: 90 days.
 
@@ -802,18 +804,14 @@ def register_tools(app):
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
         """
-        MAX_DAYS = 90
         try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            if end_dt < start_dt:
+                return "Error: end_date must be on or after start_date"
 
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+            if (end_dt - start_dt).days > 89:
+                return "Error: date range cannot exceed 90 days"
 
         trend = []
         current = start
@@ -885,15 +883,42 @@ def register_tools(app):
                 pass  # skip days with no data
             current += datetime.timedelta(days=1)
 
-        if not trend:
-            return f"No training load data found between {start_date} and {end_date}."
+                    if generic:
+                        measurement_date = generic.get("calendarDate")
+                        vo2_value = generic.get("vo2MaxValue")
 
-        return json.dumps({
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_with_data": len(trend),
-            "trend": trend,
-        }, indent=2)
+                        if (
+                            measurement_date
+                            and vo2_value is not None
+                            and start_date <= measurement_date <= end_date
+                        ):
+                            vo2_by_date[measurement_date] = round(vo2_value, 1)
+
+                except Exception:
+                    pass
+
+                current += datetime.timedelta(days=1)
+
+            result = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "days_with_data": len(trend),
+                "trend": trend,
+            }
+
+            if vo2_by_date:
+                latest_vo2_date = max(vo2_by_date)
+                result["most_recent_vo2_max"] = {
+                    "date": latest_vo2_date,
+                    "vo2_max": vo2_by_date[latest_vo2_date],
+                }
+
+            return json.dumps(result, indent=2)
+
+        except ValueError:
+            return "Error: dates must be in YYYY-MM-DD format"
+        except Exception as e:
+            return f"Error retrieving training load trend: {str(e)}"
 
     @app.tool()
     async def get_training_load_balance(date: str) -> str:
@@ -996,11 +1021,12 @@ def register_tools(app):
 
     @app.tool()
     async def get_hrv_trend(start_date: str, end_date: str) -> str:
-        """Get HRV (Heart Rate Variability) trend over a date range.
+        """Get Garmin HRV data over a date range.
 
-        Returns daily HRV values and weekly rolling averages. Single-day HRV is too noisy
-        to act on — use this tool to identify baseline shifts that signal accumulated fatigue
-        or recovery. A drop of >10ms from the 7-day baseline warrants reducing training load.
+        Returns Garmin nightly HRV when available, Garmin weekly average HRV,
+        Garmin 5-minute overnight high HRV, and Garmin HRV status/feedback.
+
+        No training or recovery interpretation is applied by this tool.
 
         Recommended range: 7-21 days. Maximum: 30 days.
 
@@ -1008,76 +1034,77 @@ def register_tools(app):
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
         """
-        MAX_DAYS = 30
         try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            if end_dt < start_dt:
+                return "Error: end_date must be on or after start_date"
 
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+            if (end_dt - start_dt).days > 29:
+                return "Error: date range cannot exceed 30 days"
 
-        trend = []
-        current = start
-        while current <= end:
-            date_str = current.isoformat()
-            try:
-                data = garmin_client.get_hrv_data(date_str)
-                if data:
-                    hrv_summary = data.get("hrvSummary", {})
-                    entry: Dict[str, Any] = {"date": date_str}
-                    last_night = hrv_summary.get("lastNight")
-                    weekly_avg = hrv_summary.get("weeklyAvg")
-                    status = hrv_summary.get("status")
-                    feedback = hrv_summary.get("feedbackPhrase")
-                    high_hrv = hrv_summary.get("lastNight5MinHigh")
-                    if last_night is not None:
-                        entry["last_night_avg_hrv_ms"] = round(last_night, 1)
-                    if weekly_avg is not None:
-                        entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
-                    if high_hrv is not None:
-                        entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
-                    if status:
-                        entry["status"] = status
-                    if feedback:
-                        entry["feedback"] = feedback
-                    if len(entry) > 1:
-                        trend.append(entry)
-            except Exception:
-                pass
-            current += datetime.timedelta(days=1)
+            trend = []
+            current = start_dt
 
-        if not trend:
-            return f"No HRV data found between {start_date} and {end_date}."
+            while current <= end_dt:
+                date_str = current.strftime("%Y-%m-%d")
 
-        # Compute 7-day rolling average from the collected data
-        hrv_values = [e.get("last_night_avg_hrv_ms") for e in trend if e.get("last_night_avg_hrv_ms") is not None]
-        rolling_avg = None
-        if hrv_values:
-            rolling_avg = round(sum(hrv_values) / len(hrv_values), 1)
+                try:
+                    hrv_data = garmin_client.get_hrv_data(date_str)
+                    summary = (hrv_data or {}).get("hrvSummary", hrv_data or {})
 
-        return json.dumps({
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_with_data": len(trend),
-            "period_avg_hrv_ms": rolling_avg,
-            "trend": trend,
-        }, indent=2)
+                    if summary:
+                        entry = {"date": date_str}
+
+                        if summary.get("lastNight") is not None:
+                            entry["last_night_hrv_ms"] = summary.get("lastNight")
+
+                        if summary.get("weeklyAvg") is not None:
+                            entry["weekly_avg_hrv_ms"] = summary.get("weeklyAvg")
+
+                        if summary.get("lastNight5MinHigh") is not None:
+                            entry["last_night_5min_high_hrv_ms"] = summary.get(
+                                "lastNight5MinHigh"
+                            )
+
+                        if summary.get("status") is not None:
+                            entry["status"] = summary.get("status")
+
+                        if summary.get("feedbackPhrase") is not None:
+                            entry["feedback"] = summary.get("feedbackPhrase")
+
+                        if len(entry) > 1:
+                            trend.append(entry)
+
+                except Exception:
+                    pass
+
+                current += datetime.timedelta(days=1)
+
+            result = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "days_with_data": len(trend),
+                "trend": trend,
+            }
+
+            return json.dumps(result, indent=2)
+
+        except ValueError:
+            return "Error: dates must be in YYYY-MM-DD format"
+        except Exception as e:
+            return f"Error retrieving HRV trend: {str(e)}"
 
     @app.tool()
     async def get_vo2max_trend(start_date: str, end_date: str) -> str:
-        """Get VO2 max trend over a date range.
+        """Get Garmin VO2 max measurements over a date range.
 
-        Returns daily VO2 max estimates from Garmin's FirstBeat algorithm. Use this to track
-        whether training is producing fitness gains over weeks or months. Flat or declining
-        VO2 max over 4+ weeks suggests insufficient training stimulus or overreaching.
+        Uses the measurement date reported by Garmin in
+        mostRecentVO2Max.generic.calendarDate. Repeated responses that refer
+        to the same Garmin measurement are deduplicated by measurement date.
 
-        Note: VO2 max estimates are smoothed and update gradually — daily changes of <0.5
-        are within normal noise. Focus on the 4-6 week trend direction.
+        The latest VO2 max measurement is returned last in the response.
+        No training interpretation is applied.
 
         If historical values are unavailable, the current profile estimate is returned
         separately and is not represented as a historical trend point.
@@ -1088,18 +1115,14 @@ def register_tools(app):
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
         """
-        MAX_DAYS = 90
         try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            if end_dt < start_dt:
+                return "Error: end_date must be on or after start_date"
 
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+            if (end_dt - start_dt).days > 89:
+                return "Error: date range cannot exceed 90 days"
 
         histories: Dict[str, List[Dict[str, Any]]] = {
             "running": [],
@@ -1225,11 +1248,13 @@ def register_tools(app):
 
     @app.tool()
     async def get_respiration_trend(start_date: str, end_date: str) -> str:
-        """Get overnight respiration rate trend over a date range.
+        """Get Garmin respiration data over a date range.
 
-        Elevated resting respiration rate (compared to personal baseline) is an early
-        warning sign for overreaching, illness, or poor recovery. Use this alongside HRV
-        trend for a complete recovery picture.
+        Returns Garmin waking and sleep respiration values when available,
+        plus an average sleep respiration rate calculated across the requested
+        period.
+
+        No health, training, or recovery interpretation is applied by this tool.
 
         Recommended range: 7-21 days. Maximum: 30 days.
 
